@@ -227,6 +227,10 @@ const CONFIG = {
   mobileRefSide: 850,     // 모바일: 데스크톱 화면 짧은 변(px) 기준 — 폰 화면 넓이 비율만큼 입자 수를 줄여 같은 밀도·밝기로 보이게
   mobileMinParticles: 0.15, // 모바일: 입자 수를 줄이는 최소 비율
   tabletParticles: 0.55,  // 태블릿(iPad 등): 입자 수 최대 비율 (데스크톱 대비) — 줄인 만큼 입자를 조금 키우고 밝게 해서 같은 모습으로
+  micAutoGain: true,      // 마이크: 들어오는 소리가 작으면 자동으로 키움 (기기마다 마이크 크기가 달라서 — 특히 iPad). 크면 그대로
+  micTargetLevel: 0.12,   // 마이크: 최근 가장 큰 소리를 이 크기(RMS)까지 맞춤 — 음악 파일 재생과 비슷한 크기
+  micMaxGain: 16,         // 마이크: 최대 몇 배까지 키울지
+  micBassBoost: 5,        // 태블릿 마이크: 저음(150Hz 이하)을 이만큼(dB) 키움 — iPad 마이크는 저음이 약하게 잡혀 킥 반응이 둔해짐 (0 = 끔)
   autoQuality: true,      // 폰·태블릿: 처음 몇 초 동안 화면이 매끄럽지 않으면(초당 50프레임 미만) 다음에 열 때 입자 수를 더 줄임 (이 기기에 기억)
   mobileDensity: 1.5,     // 모바일: 같은 밀도보다 입자를 이 배수만큼 더 써서 더 고운 모래알로 (그만큼 입자 하나는 옅게 → 전체 밝기는 데스크톱과 같음)
   shapes: ['circle', 'ovalV', 'ovalH', 'tiltDown', 'tiltUp', 'slimDown', 'slimUp', 'thinV', 'thinH'],
@@ -591,10 +595,12 @@ function detectPitch(buf, sr){
 let tabStream = null;   // 유튜브 등 탭 소리
 let micStream = null;   // 마이크 (끌 때 마이크 사용 표시도 꺼지도록 보관)
 let micCheck = null;    // 마이크를 켠 뒤 소리가 들어오는지 확인
+let micGain = null, micPeak = 0, micTd = null;   // 마이크 자동 음량: 키우는 노드 · 최근 가장 큰 원래 소리 · 파형
 function stopSource(){
   if (source) { try { source.disconnect(); } catch {} source = null; }
   if (tabStream) { tabStream.getTracks().forEach(tr => tr.stop()); tabStream = null; setYtStatus('연결이 끊겼어요', ''); }
   if (micStream) { micStream.getTracks().forEach(tr => tr.stop()); micStream = null; }
+  if (micGain) { try { micGain.disconnect(); } catch {} micGain = null; }
   vMid = vSide = vPitch = null;
   if (audioEl) { audioEl.pause(); audioEl = null; }
 }
@@ -639,8 +645,16 @@ document.getElementById('mic').onclick = async () => {
     micStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
     // iPhone·iPad: 마이크가 켜지면 오디오 장치가 녹음 모드로 바뀌며 소리 분석이 멈춘 채 남을 수 있어 다시 깨움
     try { await actx.resume(); } catch {}
-    source = actx.createMediaStreamSource(micStream); source.connect(analyser);  // 스피커로는 안 보냄(하울링 방지)
-    setupVoice(source, false);
+    source = actx.createMediaStreamSource(micStream);
+    // 마이크 → (태블릿: 저음 보강) → 자동 음량 → 분석 (스피커로는 안 보냄, 하울링 방지)
+    micGain = actx.createGain(); micGain.gain.value = 1; micPeak = 0;
+    let node = source;
+    if (DEVICE === 'tablet' && CONFIG.micBassBoost > 0) {
+      const shelf = actx.createBiquadFilter(); shelf.type = 'lowshelf'; shelf.frequency.value = 150; shelf.gain.value = CONFIG.micBassBoost;
+      node.connect(shelf); node = shelf;
+    }
+    node.connect(micGain); micGain.connect(analyser);
+    setupVoice(micGain, false);
     setMode('mic');
     if (actx.state !== 'running') toast('화면을 한 번 탭하면 소리 인식이 시작돼요', 6000);
     else if (IS_TOUCH) toast('음악 앱에서 노래를 스피커로 틀어 주세요 — 이어폰으로 들으면 소리를 받을 수 없어요', 6000);
@@ -964,6 +978,15 @@ function frame(now){
     }
   }
   if (perfCheck) checkPerf(now);
+  if (micGain && mode === 'mic' && CONFIG.micAutoGain) {   // 마이크 자동 음량: 최근 가장 큰 소리(8초 동안 천천히 내려옴)를 목표 크기로
+    if (!micTd) micTd = new Float32Array(analyser.fftSize);
+    analyser.getFloatTimeDomainData(micTd);
+    let ss = 0; for (let i = 0; i < micTd.length; i++) ss += micTd[i] * micTd[i];
+    const raw = Math.sqrt(ss / micTd.length) / Math.max(micGain.gain.value, 1e-3);   // 키우기 전 원래 크기
+    micPeak = Math.max(raw, micPeak * Math.exp(-dt / 8));
+    const want = Math.min(CONFIG.micMaxGain, Math.max(1, CONFIG.micTargetLevel / Math.max(micPeak, 1e-4)));
+    micGain.gain.setTargetAtTime(want, actx.currentTime, 1);   // 약 1초에 걸쳐 부드럽게
+  }
 
   // ---------- 목소리: 크기 · 음높이 · 확신도 ----------
   let vRaw = 0, pf = 0, pc = 0;
