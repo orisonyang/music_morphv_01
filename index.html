@@ -226,7 +226,8 @@ const CONFIG = {
   showInfo: false,        // 왼쪽 위 정보 표시 (에너지·크기·목소리·템포·볼륨 등 수치, 조절할 때 true로)
   mobileRefSide: 850,     // 모바일: 데스크톱 화면 짧은 변(px) 기준 — 폰 화면 넓이 비율만큼 입자 수를 줄여 같은 밀도·밝기로 보이게
   mobileMinParticles: 0.15, // 모바일: 입자 수를 줄이는 최소 비율
-  tabletParticles: 1.0,   // 태블릿(iPad 등): 입자 수 최대 비율 — 화면이 커서 계산상 데스크톱과 같은 입자 수가 됨. 오래된 태블릿에서 끊기면 0.6~0.8로
+  tabletParticles: 0.55,  // 태블릿(iPad 등): 입자 수 최대 비율 (데스크톱 대비) — 줄인 만큼 입자를 조금 키우고 밝게 해서 같은 모습으로
+  autoQuality: true,      // 폰·태블릿: 처음 몇 초 동안 화면이 매끄럽지 않으면(초당 50프레임 미만) 다음에 열 때 입자 수를 더 줄임 (이 기기에 기억)
   mobileDensity: 1.5,     // 모바일: 같은 밀도보다 입자를 이 배수만큼 더 써서 더 고운 모래알로 (그만큼 입자 하나는 옅게 → 전체 밝기는 데스크톱과 같음)
   shapes: ['circle', 'ovalV', 'ovalH', 'tiltDown', 'tiltUp', 'slimDown', 'slimUp', 'thinV', 'thinH'],
   holdTime: 1.6,          // (sequence 모드) 각 도형에서 머무는 시간(초)
@@ -393,10 +394,15 @@ const IS_TOUCH = matchMedia('(pointer: coarse)').matches && !matchMedia('(pointe
 const SHORT_SIDE = Math.min(screen.width, screen.height);
 const DEVICE = !IS_TOUCH ? 'desktop' : SHORT_SIDE < 600 ? 'phone' : 'tablet';
 const AREA_SCALE = (SHORT_SIDE / CONFIG.mobileRefSide) ** 2;   // 데스크톱과 같은 밀도가 되는 비율
+let perfCap = 1;   // 이 기기에서 버벅여서 기억해 둔 입자 비율 상한 (autoQuality)
+try { perfCap = Math.min(1, Math.max(.2, +localStorage.getItem('musicMorphPerf') || 1)); } catch {}
 const PARTICLE_SCALE = DEVICE === 'desktop' ? 1
-  : Math.min(DEVICE === 'tablet' ? CONFIG.tabletParticles : 1, Math.max(CONFIG.mobileMinParticles, AREA_SCALE * CONFIG.mobileDensity));
+  : Math.min(DEVICE === 'tablet' ? CONFIG.tabletParticles : 1, perfCap, Math.max(CONFIG.mobileMinParticles, AREA_SCALE * CONFIG.mobileDensity));
 if (PARTICLE_SCALE < 1) {
-  CONFIG.particleBrightness *= Math.min(1, AREA_SCALE / PARTICLE_SCALE);   // 입자가 많아진 만큼 하나는 옅게 → 겹친 전체 밝기는 같음
+  // 같은 밀도 대비 입자 비율: 많으면 입자 하나를 옅게(겹친 전체 밝기 같음), 적으면 입자를 조금 키우고 밝게(빈 느낌 없이)
+  const ratio = AREA_SCALE / PARTICLE_SCALE;
+  if (ratio < 1) CONFIG.particleBrightness *= ratio;
+  else { CONFIG.particleBrightness *= Math.min(1.5, Math.sqrt(ratio)); CONFIG.particleSize *= Math.min(1.25, Math.pow(ratio, .25)); }
   const sc = n => Math.max(1, Math.round(n * PARTICLE_SCALE));
   CONFIG.shellCounts = CONFIG.shellCounts.map(sc);
   CONFIG.innerCount = sc(CONFIG.innerCount); CONFIG.freeCount = sc(CONFIG.freeCount);
@@ -527,14 +533,18 @@ function toast(msg, ms = 4500){
 
 // ---------- 오디오 ----------
 let actx, analyser, freq, freqF, source, audioEl, mode = 'demo';
+let sink = null;   // 소리 없는 출구: Safari는 출력에 이어지지 않은 분석기를 계산하지 않을 때가 있어, 음량 0으로 스피커에 이어 둠
 function ensureCtx(){
   if (!actx) {
     actx = new (window.AudioContext || window.webkitAudioContext)();
     analyser = actx.createAnalyser(); analyser.fftSize = CONFIG.analyserSize; analyser.smoothingTimeConstant = CONFIG.analyserSmoothing;
     freq = new Uint8Array(analyser.frequencyBinCount); freqF = new Float32Array(analyser.frequencyBinCount);
+    sink = actx.createGain(); sink.gain.value = 0; sink.connect(actx.destination);
+    analyser.connect(sink);
   }
   actx.resume();
 }
+function muteOut(){ try { analyser.disconnect(); } catch {} analyser.connect(sink); }   // 스피커로 다시 내보내지 않음 (분석만)
 // 목소리 분석용 노드: 가운데(L+R) · 옆(L−R) 소리 분석기 + 음높이용(80~1100Hz) 시간 파형 분석기
 let vMid = null, vSide = null, vPitch = null, vMidF, vSideF, vTime;
 function setupVoice(src, stereo){
@@ -553,6 +563,7 @@ function setupVoice(src, stereo){
   const lp = actx.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 1100;
   mono.connect(hp); hp.connect(lp);
   vPitch = actx.createAnalyser(); vPitch.fftSize = 2048; lp.connect(vPitch);
+  [vMid, vSide, vPitch].forEach(a => a && a.connect(sink));   // Safari에서도 계산되도록
   vMidF = new Uint8Array(vMid.frequencyBinCount); vSideF = new Uint8Array(vMid.frequencyBinCount); vTime = new Float32Array(vPitch.fftSize);
 }
 // 음높이 찾기 (정규화 자기상관): { f: 주파수, c: 확신도 0~1 }
@@ -579,6 +590,7 @@ function detectPitch(buf, sr){
 }
 let tabStream = null;   // 유튜브 등 탭 소리
 let micStream = null;   // 마이크 (끌 때 마이크 사용 표시도 꺼지도록 보관)
+let micCheck = null;    // 마이크를 켠 뒤 소리가 들어오는지 확인
 function stopSource(){
   if (source) { try { source.disconnect(); } catch {} source = null; }
   if (tabStream) { tabStream.getTracks().forEach(tr => tr.stop()); tabStream = null; setYtStatus('연결이 끊겼어요', ''); }
@@ -622,13 +634,17 @@ document.getElementById('file').onchange = e => {
 document.getElementById('mic').onclick = async () => {
   try {
     ensureCtx(); stopSource();
-    try { analyser.disconnect(); } catch {}
+    muteOut();
     // 음악을 그대로 받도록 소음 제거·자동 음량·에코 제거를 끔 (폰 마이크는 기본으로 켜져 있어 음악 반응이 약해짐)
     micStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
+    // iPhone·iPad: 마이크가 켜지면 오디오 장치가 녹음 모드로 바뀌며 소리 분석이 멈춘 채 남을 수 있어 다시 깨움
+    try { await actx.resume(); } catch {}
     source = actx.createMediaStreamSource(micStream); source.connect(analyser);  // 스피커로는 안 보냄(하울링 방지)
     setupVoice(source, false);
     setMode('mic');
-    if (IS_TOUCH) toast('음악 앱에서 노래를 스피커로 틀어 주세요 — 이어폰으로 들으면 소리를 받을 수 없어요', 6000);
+    if (actx.state !== 'running') toast('화면을 한 번 탭하면 소리 인식이 시작돼요', 6000);
+    else if (IS_TOUCH) toast('음악 앱에서 노래를 스피커로 틀어 주세요 — 이어폰으로 들으면 소리를 받을 수 없어요', 6000);
+    micCheck = { t0: performance.now(), peak: 0 };   // 몇 초 동안 소리가 전혀 안 들어오면 안내
   } catch (err) { alert('마이크를 사용할 수 없습니다: ' + err.message); }
 };
 document.getElementById('demo').onclick = () => { stopSource(); setMode('demo'); };
@@ -675,7 +691,7 @@ document.getElementById('ytConnect').onclick = async () => {
     stream.getVideoTracks().forEach(tr => tr.stop());   // 화면은 필요 없어서 바로 끔
     if (!audio.length) { setYtStatus('소리가 공유되지 않았어요 — 공유 창에서 탭 오디오 공유를 켜 주세요', 'err'); return; }
     ensureCtx(); stopSource();
-    try { analyser.disconnect(); } catch {}            // 소리는 탭에서 이미 나오니 다시 내보내지 않음 (겹침 방지)
+    muteOut();                                          // 소리는 탭에서 이미 나오니 다시 내보내지 않음 (겹침 방지)
     tabStream = new MediaStream(audio);
     source = actx.createMediaStreamSource(tabStream); source.connect(analyser);
     setupVoice(source, true);
@@ -904,6 +920,19 @@ let kickIv = [], bpmTarget = 0, bpmS = 120, spinKick = 0;   // 템포·비트 �
 let vPitchN = 0;   // 목소리 음높이 신호 0~1.25 (곡 평균 음 = 0.5)
 const vMix = (w) => w[0] * vPitchN + w[1] * voice;   // [음높이, 크기] 비중대로 섞은 목소리 신호
 let vConf = 0, vSt = 0, vStAvg = 0, vStMean = 0, vLvl = 0, vPeak = .05, vPres = 0, voice = 0, vDev = 0, vVibAmt = 0, spinMul = 1, rotAng = 0, vHz = 0;
+// 폰·태블릿 화면이 매끄러운지 확인: 시작 3~8초 사이 평균이 초당 50프레임 미만이면 다음에 열 때 입자를 30% 줄임 (이 기기에만 기억)
+let perfCheck = CONFIG.autoQuality && DEVICE !== 'desktop' ? { n: 0, t0: 0 } : null;
+function checkPerf(now){
+  if (document.visibilityState !== 'visible') { perfCheck.n = 0; perfCheck.t0 = 0; return; }
+  if (now < 3000) return;
+  if (!perfCheck.t0) { perfCheck.t0 = now; return; }
+  perfCheck.n++;
+  const el = now - perfCheck.t0;
+  if (el < 5000) return;
+  const fps = perfCheck.n / el * 1000;
+  if (fps < 50 && PARTICLE_SCALE > .2) { try { localStorage.setItem('musicMorphPerf', Math.max(.2, PARTICLE_SCALE * .7).toFixed(3)); } catch {} }
+  perfCheck = null;
+}
 function frame(now){
   const dt = Math.min(.05, (now - last) / 1000); last = now; t += dt;
   let b, mi, hi, kb;   // kb: 킥 감지용 저음 (큰 소리에도 잘리지 않음)
@@ -927,6 +956,14 @@ function frame(now){
     hi = band(3000, 10000) * 1.6;
   }
   follow('bass', Math.min(b,1), dt); follow('mid', Math.min(mi,1), dt); follow('high', Math.min(hi,1), dt);
+  if (micCheck && mode === 'mic') {   // 마이크를 켜고 4초 동안 소리가 전혀 없으면 안내
+    micCheck.peak = Math.max(micCheck.peak, b + mi + hi);
+    if (now - micCheck.t0 > 4000) {
+      if (micCheck.peak < .02) toast(actx.state !== 'running' ? '화면을 한 번 탭하면 소리 인식이 시작돼요' : '마이크에 소리가 들어오지 않아요 — 설정에서 이 사이트의 마이크 사용을 허용했는지, 음악이 스피커로 나오는지 확인해 주세요', 7000);
+      micCheck = null;
+    }
+  }
+  if (perfCheck) checkPerf(now);
 
   // ---------- 목소리: 크기 · 음높이 · 확신도 ----------
   let vRaw = 0, pf = 0, pc = 0;
